@@ -300,6 +300,11 @@ Using <code>N</code> and <code>P</code> we compute <code>F = N * P</code>
 <code>F</code> constricts the range of the hashed values accordingly in order to
 achieve our desired false positive rate.
 
+In addition, to help optimize the algorithm, we use a fast range algorithm[7],
+multiplying the hashed value by F and taking only the top 64 bits. This fairly
+distributes the values over F without division and can be done with fewer cycles
+cycles on CPUs that have 128-bit registers.
+
 The following routine computes the ''uncompressed'' set given the parameters
 above:
 <pre>
@@ -308,7 +313,7 @@ hashed_set_construct(N, P, raw_items, k): -> []uint64:
 
     let set_items = []
     for item in raw_items:
-        let set_value = siphash(k, item) % F
+        let set_value = (siphash(k, item) * F) >> 64
         set_items.append(set_value)
 
     set_items.sort()
@@ -383,7 +388,7 @@ item:
 <pre>
 gcs_match(key: [16]byte, compressed_set: []byte, target: []byte, fp, N: int) -> bool:
     // First we'll map the item into the domain of our encoding.
-    let item = siphash(key, target) % (N * (1 << fp))
+    let item = (siphash(key, target) * (N * (1 << fp))) >> 64
 
     stream = new_bit_stream(compressed_set)
 
@@ -430,7 +435,7 @@ gcs_match_any(key: [16]byte, compressed_set: []byte, targets [][]byte,
     // encoding, sorting as a last step so we can zip through the values.
     let items = []
     for t in target:
-        let item = siphash(key, t) % (N * (1 << fp))
+        let item = (siphash(key, t) * (N * (1 << fp))) >> 64
         items.append(item)
     items.sort()
 
@@ -484,9 +489,9 @@ To start, we reserve a currently unutilized service bit. This is required as
 light clients will need to ''preferentially'' peer to full-nodes that support
 the features outlined in this BIP.
 
-The 4th service bit will now be dedicated to signaling support for the
+The 6th service bit will now be dedicated to signaling support for the
 features described within this BIP: 
-* <code>CFNodeCF = 1 << 4</code>
+* <code>CFNodeCF = 1 << 6</code>
 
 ==== Filter Types ====
 
@@ -503,14 +508,17 @@ needs to sync a basic Bitcoin wallet. In order to facilitate this use-case, for
 each transaction, normal filters contain:
 * The outpoints of each input within a transaction.
 * The data-pushes contained within the public key script of each output within the transaction.
+* The <code>txid</code> of the transaction itself.
 
 An <code>Extended</code> filter contains extra data that is meant to facilitate the
 adoption of more advanced smart contracting applications by this BIP. For each
 transaction found in a block, an <code>Extended</code> filter contains:
 * Each item within the witness stack of an input (if the input has a witness).
 * Each data push of the signature script of an input.
-* The <code>txid</code> of the transaction itself.
 
+Notably, this construction does not currently interpret P2SH scripts or witness
+scripts to extract data pushes from them; however, future filter types may be
+designed to do so.
 
 ==== Filter Construction ====
 
@@ -533,6 +541,13 @@ construct_normal_gcs_filter(block, fp) -> []byte:
 
     let raw_items = []
     for tx in block.transactions:
+        let txid = tx.hash()
+        raw_items.append(txid)
+
+        for output in tx.outputs:
+            let output_bytes = extract_push_datas(output.script)
+            raw_items.append(output_bytes)
+
         if tx.is_coinbase():
             continue
 
@@ -542,16 +557,12 @@ construct_normal_gcs_filter(block, fp) -> []byte:
             let input_bytes = input.hash || input.index
             raw_items.append(input_bytes)
 
-        for output in tx.outputs:
-            let output_bytes = extract_push_datas(output.script)
-            raw_items.append(output_bytes)
-
     let N = len(raw_items)
     let F = N * P
 
     let hashed_items = []
     for raw_item in raw_items:
-        let hashed_item = siphash_key(siphash_key, raw_item) % F
+        let hashed_item = (siphash_key(siphash_key, raw_item) * F) >> 64
         hashed_items.append(hashed_item)
 
     hashed_items.sort()
@@ -570,9 +581,6 @@ construct_extended_gcs_filter(block, fp) -> []byte:
 
     let raw_items = []
     for tx in block.transactions:
-        let txid = tx.hash()
-        raw_items.append(txid)
-
         if tx.is_coinbase():
            continue
 
@@ -589,7 +597,7 @@ construct_extended_gcs_filter(block, fp) -> []byte:
 
     let hashed_items = []
     for raw_item in raw_items:
-        let hashed_item = siphash_key(siphash_key, raw_item) % F
+        let hashed_item = (siphash_key(siphash_key, raw_item) * F) >> 64
         hashed_items.append(hashed_item)
 
     hashed_items.sort()
@@ -642,10 +650,10 @@ The filter header chain for a particular filter type is described by the
 following recurrence:
 <pre>
 filter_header(n: uint) -> [32]byte = 
-   let zero_hash [32]byte = {0..32}
+   let zero_hash [32]byte = {0*32}
 
    if n == 0:
-       double-sha-256(genesis_hash || filter(0))
+       double-sha-256(genesis_block.prevblock || filter(0))
 
    match filter(n):
       case Some:
@@ -653,11 +661,12 @@ filter_header(n: uint) -> [32]byte =
       case None:
           double-sha-256(filter_header(n-1) || double-sha-256(zero_hash))
 
-   where fitler(n) is the filter for block height n
+   where filter(n) is the filter for block height n
 </pre>
 
-The filter header for the genesis block uses the hash of the genesis block
-itself, as there's no prior filter header (by definition).
+The filter header for the genesis block uses the hash stored in the prevblock
+field of the genesis block header itself, as there's no prior filter header
+(by definition).
 
 Due to the nature of filter construction, it's possible to construct a block
 such that an "empty" filter will be produced. This is the case of a coinbase
@@ -679,7 +688,7 @@ bandwidth), a light client instead does the following:
 
 <pre>
 verify_from_tip(tip_block_hash: [32]byte):
-    let filter_types = {supported_fitler_types...}
+    let filter_types = {supported_filter_types...}
     let connected_peers = {list_of_connected_full_nodes...}
 
     for filter_type in filter_types:
@@ -717,15 +726,15 @@ The <code>getcfheaders</code> message is defined as follows:
 ! Data Type
 ! Comments
 |-
-| 4
-| ProtocolVersion
-| uint64
-| Protocol Version.
-|-
-| Var-int
+| Var-Int
 | NumBlockLocators
 | uint64
 | Number of block locators.
+|-
+| NumBlockLocators * 32
+| BlockLocatorHashes
+| [NumBlockLocators][32]byte
+| Block locator hashes, with the same semantics as in <code>getheaders</code>.
 |-
 | 32
 | HashStop
@@ -746,19 +755,19 @@ The <code>cfheaders</code> message is defined as follows:
 
 {| class="wikitable"
 ! Field Size
-! Description
+! Descriptions
 ! Data Type
 ! Comments
 |-
 | 32
 | StopHash
 | []byte
-| Protocol Version.
+| Block hash for the last filter header returned, for locating the filter headers in the blockchain.
 |-
 | 1
 | FilterType
 | byte
-| Number of block locators.
+| Byte identifying the type of filter headers being returned.
 |-
 | Var-Int
 | NumHeaders
@@ -788,7 +797,7 @@ The <code>getcfilter</code> message is defined as follows:
 | 32
 | BlockHash
 | [32]byte
-| Block hash of the Bitcoin block on wishes to fetch a filter for.
+| Block hash of the Bitcoin block for which the client wishes to fetch a filter.
 |-
 | 1
 | FilterType
@@ -806,17 +815,17 @@ The <code>cfilter</code> message is defined as follows:
 | 32
 | BlockHash
 | [32]byte
-| Block hash of the Bitcoin block one wishes to fetch a filter for.
+| Block hash of the Bitcoin block for which the filter is being returned.
 |-
 | 1
 | FilterType
 | byte
-| Byte identifying the type of filter requested.
+| Byte identifying the type of filter being returned.
 |-
 | Var-Int
 | NumFilterBytes
 | uint64
-| A variable length integer encoding the number of bytes of the filter following field.
+| A variable length integer encoding the number of bytes of the filter in the following field.
 |-
 | NumFilterBytes
 | FilterBytes
@@ -824,7 +833,7 @@ The <code>cfilter</code> message is defined as follows:
 | The raw compressed compact filter for this block.
 |}
 
-The <code>BlockHash</code> field is included in both message as this allows
+The <code>BlockHash</code> field is included in both messages as this allows
 easily matching requests against responses, as the responses aren't
 self-identifying like block headers are (via own hash).
 
@@ -870,7 +879,7 @@ on-chain events. Examples of such applications include Lightning.
 
 == Implementation Notes ==
 
-Zero-length filters are sent without an <code>N</code>, value allowing us to save
+Zero-length filters are sent without an <code>N</code> value, allowing us to save
 <code>4-bytes</code>. Clients are able to verify that a filter will be
 <code>null</code> before requesting it (as it will just be the prior filter
 header hashed with zero bytes). Clients can take this fact into account in
@@ -901,9 +910,9 @@ block 1 (assume you generate your own filters/headers for the genesis block).
 
 We would like to thank bfd (from the bitcoin-dev mailing list) for bringing the
 basis of this BIP to our attention, Greg Maxwell for pointing us in the
-direction of Golomb-Rice coding, Joseph Poon for suggesting the filter
-header chain scheme, and Pedro Martelletto for writing the initial indexing
-code for <code>btcd</code>.
+direction of Golomb-Rice coding and fast range optimization, Joseph Poon for
+suggesting the filter header chain scheme, and Pedro Martelletto for writing the
+initial indexing code for <code>btcd</code>.
 
 We would also like to thank Dave Collins, JJ Jeffrey, Eric Lombrozo for useful
 discussions.
@@ -926,8 +935,8 @@ alternatives along with our rationale for not pursuing them.
 
 ==== Cryptographic Accumulators ====
 
-Cryptographic accumulators [7] are a cryptographic data structure that enables
-a (amongst other operations) a one way membership test. One advantage of
+Cryptographic accumulators [8] are a cryptographic data structure that enables
+(amongst other operations) a one way membership test. One advantage of
 accumulators are that they are ''constant'' size, independent on the number of
 elements inserted into the accumulator. However, current constructions of
 cryptographic accumulators require an initial trusted set up. Additionally,
@@ -962,4 +971,6 @@ TODO(alex):
 
 6. http://urchin.earth.li/~twic/Golombs_Original_Paper/
 
-7. https://en.wikipedia.org/wiki/Accumulator_(cryptography)
+7. https://lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/
+
+8. https://en.wikipedia.org/wiki/Accumulator_(cryptography)
