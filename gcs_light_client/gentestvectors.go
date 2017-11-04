@@ -13,11 +13,12 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"path"
 
 	"github.com/roasbeef/btcd/chaincfg"
 	"github.com/roasbeef/btcd/chaincfg/chainhash"
+	"github.com/roasbeef/btcd/rpcclient"
 	"github.com/roasbeef/btcd/wire"
-	"github.com/roasbeef/btcrpcclient"
 	"github.com/roasbeef/btcutil/gcs"
 	"github.com/roasbeef/btcutil/gcs/builder"
 )
@@ -47,24 +48,38 @@ func main() {
 		files[i] = file
 		basicFilter, err := buildBasicFilter(
 			chaincfg.TestNet3Params.GenesisBlock, uint8(i))
-		if err != nil {
+		if err != nil && err != gcs.ErrNoData {
 			fmt.Println("Error generating basic filter: ", err.Error())
 			return
 		}
 		prevBasicHeaders[i] = builder.MakeHeaderForFilter(basicFilter,
 			chaincfg.TestNet3Params.GenesisBlock.Header.PrevBlock)
+		if basicFilter == nil {
+			basicFilter = &gcs.Filter{}
+		}
 		extFilter, err := buildExtFilter(
 			chaincfg.TestNet3Params.GenesisBlock, uint8(i))
-		if err != nil {
+		if err != nil && err != gcs.ErrNoData {
 			fmt.Println("Error generating ext filter: ", err.Error())
 			return
 		}
 		prevExtHeaders[i] = builder.MakeHeaderForFilter(extFilter,
 			chaincfg.TestNet3Params.GenesisBlock.Header.PrevBlock)
+		if extFilter == nil {
+			extFilter = &gcs.Filter{}
+		}
 		err = chaincfg.TestNet3Params.GenesisBlock.Serialize(&blockBuf)
 		if err != nil {
 			fmt.Println("Error serializing block to buffer: ", err.Error())
 			return
+		}
+		var bfBytes []byte
+		var efBytes []byte
+		if basicFilter.N() > 0 {
+			bfBytes = basicFilter.NBytes()
+		}
+		if extFilter.N() > 0 { // Exclude special case for block 987876
+			efBytes = extFilter.NBytes()
 		}
 		err = writeCSVRow(
 			file,
@@ -73,8 +88,8 @@ func main() {
 			blockBuf.Bytes(),
 			chaincfg.TestNet3Params.GenesisBlock.Header.PrevBlock,
 			chaincfg.TestNet3Params.GenesisBlock.Header.PrevBlock,
-			basicFilter.NBytes(),
-			extFilter.NBytes(),
+			bfBytes,
+			efBytes,
 			prevBasicHeaders[i],
 			prevExtHeaders[i],
 		)
@@ -83,19 +98,20 @@ func main() {
 			return
 		}
 	}
-	cert, err := ioutil.ReadFile("/home/alex/.btcd/rpc.cert")
+	cert, err := ioutil.ReadFile(
+		path.Join(os.Getenv("HOME"), "/.btcd/rpc.cert"))
 	if err != nil {
 		fmt.Println("Couldn't read RPC cert: ", err.Error())
 		return
 	}
-	conf := btcrpcclient.ConnConfig{
+	conf := rpcclient.ConnConfig{
 		Host:         "127.0.0.1:18334",
 		Endpoint:     "ws",
 		User:         "kek",
 		Pass:         "kek",
 		Certificates: cert,
 	}
-	client, err := btcrpcclient.New(&conf, nil)
+	client, err := rpcclient.New(&conf, nil)
 	if err != nil {
 		fmt.Println("Couldn't create a new client: ", err.Error())
 		return
@@ -131,14 +147,17 @@ func main() {
 				basicFilter = &gcs.Filter{}
 			}
 			extFilter, err := buildExtFilter(block, uint8(i))
-			if err != nil { // No need to check for empty filter because coinbase has a TXID
+			if err != nil && err != gcs.ErrNoData {
 				fmt.Println("Error generating ext filter: ", err.Error())
 				return
 			}
 			extHeader := builder.MakeHeaderForFilter(extFilter,
 				prevExtHeaders[i])
+			if extFilter == nil {
+				extFilter = &gcs.Filter{}
+			}
 			if i == builder.DefaultP { // This is the default filter size so we can check against the server's info
-				filter, err := client.GetCFilter(blockHash, false)
+				filter, err := client.GetCFilter(blockHash, wire.GCSFilterRegular)
 				if err != nil {
 					fmt.Println("Error getting basic filter: ", err.Error())
 					return
@@ -149,16 +168,17 @@ func main() {
 					fmt.Println("Basic filter doesn't match!")
 					return
 				}
-				filter, err = client.GetCFilter(blockHash, true)
+				filter, err = client.GetCFilter(blockHash, wire.GCSFilterExtended)
 				if err != nil {
 					fmt.Println("Error getting extended filter: ", err.Error())
 					return
 				}
-				if !bytes.Equal(filter.Data, extFilter.NBytes()) {
+				if !bytes.Equal(filter.Data, extFilter.NBytes()) &&
+					(len(filter.Data) != 0 || len(extFilter.NBytes()) != 4) {
 					fmt.Println("Extended filter doesn't match!")
 					return
 				}
-				header, err := client.GetCFilterHeader(blockHash, false)
+				header, err := client.GetCFilterHeader(blockHash, wire.GCSFilterRegular)
 				if err != nil {
 					fmt.Println("Error getting basic header: ", err.Error())
 					return
@@ -167,7 +187,7 @@ func main() {
 					fmt.Println("Basic header doesn't match!")
 					return
 				}
-				header, err = client.GetCFilterHeader(blockHash, true)
+				header, err = client.GetCFilterHeader(blockHash, wire.GCSFilterExtended)
 				if err != nil {
 					fmt.Println("Error getting extended header: ", err.Error())
 					return
@@ -181,8 +201,12 @@ func main() {
 			switch height {
 			case 1, 2, 3, 926485, 987876: // Blocks for test cases
 				var bfBytes []byte
-				if basicFilter.N() > 0 { // Exclude special case for block 987876
+				var efBytes []byte
+				if basicFilter.N() > 0 {
 					bfBytes = basicFilter.NBytes()
+				}
+				if extFilter.N() > 0 { // Exclude special case for block 987876
+					efBytes = extFilter.NBytes()
 				}
 				writeCSVRow(
 					files[i],
@@ -192,7 +216,7 @@ func main() {
 					prevBasicHeaders[i],
 					prevExtHeaders[i],
 					bfBytes,
-					extFilter.NBytes(),
+					efBytes,
 					basicHeader,
 					extHeader)
 			}
@@ -243,6 +267,11 @@ func buildBasicFilter(block *wire.MsgBlock, p uint8) (*gcs.Filter, error) {
 	// adding the outpoint data as well as the data pushes within the
 	// pkScript.
 	for i, tx := range block.Transactions {
+		// First we'll compute the bash of the transaction and add that
+		// directly to the filter.
+		txHash := tx.TxHash()
+		b.AddHash(&txHash)
+
 		// Skip the inputs for the coinbase transaction
 		if i != 0 {
 			// Each each txin, we'll add a serialized version of
@@ -284,11 +313,6 @@ func buildExtFilter(block *wire.MsgBlock, p uint8) (*gcs.Filter, error) {
 	// transaction as well as each piece of witness data included in both
 	// the sigScript and the witness stack of an input.
 	for i, tx := range block.Transactions {
-		// First we'll compute the bash of the transaction and add that
-		// directly to the filter.
-		txHash := tx.TxHash()
-		b.AddHash(&txHash)
-
 		// Skip the inputs for the coinbase transaction
 		if i != 0 {
 			// Next, for each input, we'll add the sigScript (if
